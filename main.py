@@ -2,15 +2,16 @@ import time
 import requests
 import pandas as pd
 from datetime import datetime
+import os
 from pybit.unified_trading import HTTP
 
 # =================================================================
 # CONFIGURAZIONE UTENTE
 # =================================================================
-API_KEY      = "26tNwg57oCDvlNidYT"
-API_SECRET   = "WQ84S2dhZ9FVoXkJ7WqWCt6F7HSXR4fsrqhH"
-TELEGRAM_TOKEN   = "6916198243:AAFTF66uLYSeqviL5YnfGtbUkSjTwPzah6s"
-TELEGRAM_CHAT_ID = "820279313"
+API_KEY = os.getenv('BYBIT_API_KEY')
+API_SECRET = os.getenv('BYBIT_API_SECRET')
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
 SYMBOL = "ETHUSDT"
 FIXED_SIZE_USD = 500  # Size fissa in USDT per ogni trade
