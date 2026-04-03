@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 from pybit.unified_trading import HTTP
 
 # =================================================================
-# CONFIGURAZIONE (Parametri ottimizzati per replica Pine Script)
+# CONFIGURAZIONE (Aggiornata per TF 15m)
 # =================================================================
 API_KEY = os.getenv('API_KEY')
 API_SECRET = os.getenv('API_SECRET')
@@ -17,8 +17,10 @@ SYMBOL = "ETHUSDT"
 FIXED_SIZE_USD = 500 
 DELTA_THRESHOLD = 0.0001
 SL_PERC = 1.3 / 100
-TP_PERC = 5.0 / 100
-TF_MINUTES = 30 
+TP_PERC = 6.0 / 100
+
+# CAMBIO TF: Impostato a 15 minuti
+TF_MINUTES = 15  
 # =================================================================
 
 session = HTTP(
@@ -28,7 +30,6 @@ session = HTTP(
     recv_window=10000
 )
 
-# Variabili di stato
 last_prediction = "Long" 
 last_trade_day = datetime.now(timezone.utc).day
 
@@ -41,7 +42,6 @@ def send_telegram(message):
         pass
 
 def get_current_position_info():
-    """Ritorna (side, qty) se c'è una posizione, altrimenti (None, 0)"""
     try:
         res = session.get_positions(category="linear", symbol=SYMBOL)
         if res.get('retCode') == 0:
@@ -55,7 +55,6 @@ def get_current_position_info():
         return None, 0
 
 def force_daily_reset():
-    """Chiude qualsiasi posizione aperta all'inizio del nuovo giorno"""
     try:
         side, qty = get_current_position_info()
         if side:
@@ -64,20 +63,19 @@ def force_daily_reset():
                 category="linear", symbol=SYMBOL, side=exit_side, 
                 orderType="Market", qty=str(qty)
             )
-            send_telegram(f"🌅 **RESET GIORNALIERO**\nChiuso {side} per fine candela Daily.\nSi riparte da zero!")
+            send_telegram(f"🌅 **RESET GIORNALIERO**\nChiuso {side} per fine candela Daily.")
             time.sleep(5)
     except Exception as e:
-        send_telegram(f"🚨 Errore durante il reset giornaliero: {e}")
+        send_telegram(f"🚨 Errore reset: {e}")
 
 def get_daily_confidence():
-    """Recupera dati Klines e calcola la direzione"""
     try:
-        time.sleep(random.uniform(1, 2))
+        # Aggiungiamo un piccolo delay casuale per evitare spam API
+        time.sleep(random.uniform(0.5, 1.5))
         res = session.get_kline(category="linear", symbol=SYMBOL, interval="D", limit=2)
         if res.get('retCode') != 0:
             return None, None
         klines = res['result']['list']
-        # klines[0] è oggi (in corso), klines[1] è ieri (chiusa)
         d_close_now = float(klines[0][4])      
         d_close_prev = float(klines[1][4]) 
         confidence = (d_close_now - d_close_prev) / d_close_prev
@@ -87,11 +85,11 @@ def get_daily_confidence():
         return None, None
 
 def execute_smart_trade(side, qty, price):
-    """Esegue ordine Limit con fallback Market e TP/SL"""
     try:
         tp = price * (1 + TP_PERC) if side == "Buy" else price * (1 - TP_PERC)
         sl = price * (1 - SL_PERC) if side == "Buy" else price * (1 + SL_PERC)
 
+        # Arrotondamento tick size (ETH solitamente 2 decimali)
         order = session.place_order(
             category="linear", symbol=SYMBOL, side=side, orderType="Limit",
             price=str(round(price, 2)), qty=str(round(qty, 2)),
@@ -101,51 +99,47 @@ def execute_smart_trade(side, qty, price):
         
         if order.get('retCode') == 0:
             order_id = order['result']['orderId']
-            send_telegram(f"🚀 **NUOVA OPERAZIONE {side}**\nPrezzo: {round(price, 2)}\nQty: {round(qty, 2)}")
+            send_telegram(f"🚀 **ENTRY {TF_MINUTES}m - {side}**\nPrezzo: {round(price, 2)}\nQty: {round(qty, 2)}")
             
-            time.sleep(120) # Attesa per esecuzione Limit
+            # Ridotto tempo attesa Limit per TF più veloce (15m non aspetta 2 min)
+            time.sleep(45) 
             
             check = session.get_open_orders(category="linear", symbol=SYMBOL, orderId=order_id)
-            
-            if check.get('retCode') == 0 and not check['result']['list']:
-                send_telegram("✅ Ordine LIMIT eseguito.")
-            elif check.get('retCode') == 0 and check['result']['list']:
-                try:
-                    session.cancel_order(category="linear", symbol=SYMBOL, orderId=order_id)
-                    session.place_order(
-                        category="linear", symbol=SYMBOL, side=side, orderType="Market",
-                        qty=str(round(qty, 2)), takeProfit=str(round(tp, 2)), stopLoss=str(round(sl, 2)),
-                        tpTriggerBy="MarkPrice", slTriggerBy="MarkPrice"
-                    )
-                    send_telegram(f"⚡ Entrato MARKET (Limit scaduto)")
-                except Exception as e:
-                    if "110001" in str(e): send_telegram("✅ Ordine eseguito last second.")
+            if check.get('retCode') == 0 and check['result']['list']:
+                session.cancel_order(category="linear", symbol=SYMBOL, orderId=order_id)
+                session.place_order(
+                    category="linear", symbol=SYMBOL, side=side, orderType="Market",
+                    qty=str(round(qty, 2)), takeProfit=str(round(tp, 2)), stopLoss=str(round(sl, 2)),
+                    tpTriggerBy="MarkPrice", slTriggerBy="MarkPrice"
+                )
+                send_telegram(f"⚡ Market Fallback eseguito.")
         else:
             send_telegram(f"❌ Bybit Error: {order.get('retMsg')}")
     except Exception as e:
-        send_telegram(f"🚨 Errore critico: {e}")
+        send_telegram(f"🚨 Errore ordine: {e}")
 
 def run_loop():
     global last_prediction, last_trade_day
-    print(f"🤖 Bot Online | TF: {TF_MINUTES}m | Daily Reset: Attivo")
+    print(f"🤖 Bot Online | TF: {TF_MINUTES}m | ETH Operativo")
 
     while True:
         try:
             now = datetime.now(timezone.utc)
             
-            # --- 1. CONTROLLO RESET GIORNALIERO (Mezzanotte UTC) ---
+            # 1. RESET GIORNALIERO
             if now.day != last_trade_day:
                 force_daily_reset()
                 last_trade_day = now.day
             
-            # --- 2. CALCOLO ATTESA PROSSIMO SLOT ---
+            # 2. CALCOLO ATTESA (Sincronizzato al minuto 00, 15, 30, 45)
             minutes_to_next = TF_MINUTES - (now.minute % TF_MINUTES)
-            seconds_to_wait = (minutes_to_next * 60) - now.second + 12
+            seconds_to_wait = (minutes_to_next * 60) - now.second + 5 # 5s di buffer
             
-            print(f"💤 In attesa del prossimo check ({int(seconds_to_wait)}s)...")
-            time.sleep(max(seconds_to_wait, 5))
+            if seconds_to_wait > 0:
+                print(f"💤 Prossimo scan tra {int(seconds_to_wait)}s...")
+                time.sleep(seconds_to_wait)
 
-            # --- 3. ANALISI E OPERATIVITÀ ---
+            # 3. ANALISI
             confidence, current_price = get_daily_confidence()
             
             if confidence is not None:
@@ -158,7 +152,7 @@ def run_loop():
 
                 side_active, _ = get_current_position_info()
                 
-                # Entra solo se siamo Flat (nessuna posizione)
+                # Operatività: Entra se flat
                 if side_active is None:
                     qty = FIXED_SIZE_USD / current_price
                     side_to_open = "Buy" if prediction == "Long" else "Sell"
@@ -168,7 +162,7 @@ def run_loop():
 
         except Exception as e:
             print(f"Errore loop: {e}")
-            time.sleep(60)
+            time.sleep(30)
 
 if __name__ == "__main__":
     run_loop()
