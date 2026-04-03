@@ -19,11 +19,9 @@ DELTA_THRESHOLD = 0.0001
 SL_PERC = 1.3 / 100
 TP_PERC = 5.0 / 100
 
-# TIMEFRAME IMPOSTATO A 30 MINUTI
 TF_MINUTES = 30 
 # =================================================================
 
-# Sessione Bybit con finestra di ricezione ampia per evitare lag
 session = HTTP(
     testnet=False, 
     api_key=API_KEY, 
@@ -42,7 +40,7 @@ def send_telegram(message):
         pass
 
 def is_position_open():
-    """Controlla se ci sono posizioni attive su ETH"""
+    """Controlla se ci sono posizioni attive"""
     try:
         res = session.get_positions(category="linear", symbol=SYMBOL)
         if res.get('retCode') == 0:
@@ -52,22 +50,17 @@ def is_position_open():
                     return True
         return False
     except Exception as e:
-        print(f"⚠️ Errore posizione: {e}")
+        print(f"⚠️ Errore check posizione: {e}")
         return False
 
 def get_daily_confidence():
-    """Calcola la forza del trend rispetto alla chiusura di ieri"""
+    """Recupera dati Klines"""
     try:
-        # Piccolo delay per non colpire l'API al millisecondo zero
         time.sleep(random.uniform(1, 3))
         res = session.get_kline(category="linear", symbol=SYMBOL, interval="D", limit=2)
-        
         if res.get('retCode') != 0:
-            print(f"⚠️ Bybit Error: {res.get('retMsg')}")
             return None, None
-            
         klines = res['result']['list']
-        # klines[0] oggi, klines[1] ieri
         d_close_now = float(klines[0][4])      
         d_close_prev = float(klines[1][4]) 
         confidence = (d_close_now - d_close_prev) / d_close_prev
@@ -77,13 +70,11 @@ def get_daily_confidence():
         return None, None
 
 def execute_smart_trade(side, qty, price):
-    """Esegue ordine con 2 decimali e fallback Market"""
+    """Logica di entrata con gestione messaggi pulita"""
     try:
         tp = price * (1 + TP_PERC) if side == "Buy" else price * (1 - TP_PERC)
         sl = price * (1 - SL_PERC) if side == "Buy" else price * (1 + SL_PERC)
 
-        print(f"🚀 ORDINE {side}: Qty {round(qty, 2)} @ {round(price, 2)}")
-        
         order = session.place_order(
             category="linear", symbol=SYMBOL, side=side, orderType="Limit",
             price=str(round(price, 2)), qty=str(round(qty, 2)),
@@ -93,56 +84,52 @@ def execute_smart_trade(side, qty, price):
         
         if order.get('retCode') == 0:
             order_id = order['result']['orderId']
-            send_telegram(f"🔔 Segnale {side} rilevato.\nPrezzo: {round(price, 2)}\nQty: {round(qty, 2)}")
+            send_telegram(f"🚀 ORDINE {side} INVIATO\nPrezzo: {round(price, 2)}\nQty: {round(qty, 2)}")
             
-            time.sleep(120) # Attesa fill
+            time.sleep(120) 
             
-            # Controllo se l'ordine è ancora aperto
+            # Controllo se eseguito
             check = session.get_open_orders(category="linear", symbol=SYMBOL, orderId=order_id)
-            if check.get('retCode') == 0 and check['result']['list']:
-                session.cancel_order(category="linear", symbol=SYMBOL, orderId=order_id)
-                session.place_order(
-                    category="linear", symbol=SYMBOL, side=side, orderType="Market",
-                    qty=str(round(qty, 2)), takeProfit=str(round(tp, 2)), stopLoss=str(round(sl, 2)),
-                    tpTriggerBy="MarkPrice", slTriggerBy="MarkPrice"
-                )
-                send_telegram(f"⚡ Entrato MARKET {side} (Limit scaduto)")
-            else:
-                send_telegram(f"✅ Ordine LIMIT eseguito!")
+            
+            if check.get('retCode') == 0 and not check['result']['list']:
+                send_telegram("✅ ORDINE FILLATO (Limit)")
+            
+            elif check.get('retCode') == 0 and check['result']['list']:
+                try:
+                    session.cancel_order(category="linear", symbol=SYMBOL, orderId=order_id)
+                    session.place_order(
+                        category="linear", symbol=SYMBOL, side=side, orderType="Market",
+                        qty=str(round(qty, 2)), takeProfit=str(round(tp, 2)), stopLoss=str(round(sl, 2)),
+                        tpTriggerBy="MarkPrice", slTriggerBy="MarkPrice"
+                    )
+                    send_telegram(f"⚡ ENTRATO MARKET {side} (Limit scaduto)")
+                except Exception as e:
+                    if "110001" in str(e):
+                        send_telegram("✅ ORDINE FILLATO (Last second)")
+                    else:
+                        send_telegram(f"🚨 Errore cancel/market: {e}")
         else:
-            send_telegram(f"❌ Bybit Error: {order.get('retMsg')}")
+            send_telegram(f"❌ Bybit rifiuto ordine: {order.get('retMsg')}")
     except Exception as e:
-        send_telegram(f"🚨 Errore Execute: {e}")
+        send_telegram(f"🚨 Errore critico esecuzione: {e}")
 
 def run_loop():
     global last_prediction
-    send_telegram(f"🤖 Bot TrumpShipper ONLINE (TF{TF_MINUTES}m).")
-    print(f"🚀 Bot avviato su Timeframe {TF_MINUTES} minuti.")
+    print("🚀 Bot avviato in modalità Silenziosa (TF30).")
 
     while True:
         try:
             now = datetime.now(timezone.utc)
-            
-            # --- CALCOLO PAUSA DINAMICA PER TF30 ---
-            # Trova quanti minuti mancano alla prossima mezz'ora (00 o 30)
             minutes_to_next = TF_MINUTES - (now.minute % TF_MINUTES)
-            # Sveglia a +12 secondi dall'inizio del minuto per "pulizia" API
             seconds_to_wait = (minutes_to_next * 60) - now.second + 12
             
             if seconds_to_wait <= 0: 
                 seconds_to_wait = TF_MINUTES * 60 
             
-            # Jitter casuale per non essere "uno dei tanti"
             total_sleep = seconds_to_wait + random.uniform(1, 4)
-            
-            next_run = now + timedelta(seconds=total_sleep)
-            print(f"💤 Pausa di {int(total_sleep)}s. Prossimo check: {next_run.strftime('%H:%M:%S')} UTC")
-            
+            print(f"💤 Sleeping... Next check in {int(total_sleep)}s")
             time.sleep(total_sleep)
 
-            # --- AZIONE ---
-            print(f"🎯 Sveglia slot {datetime.now(timezone.utc).strftime('%H:%M')} UTC")
-            
             confidence, current_price = get_daily_confidence()
             
             if confidence is not None:
@@ -153,10 +140,7 @@ def run_loop():
                 else:
                     prediction = last_prediction
 
-                pos_open = is_position_open()
-                print(f"📊 [TF30] Conf: {round(confidence, 6)} | Pred: {prediction} | Open: {pos_open}")
-
-                if not pos_open:
+                if not is_position_open():
                     qty = FIXED_SIZE_USD / current_price
                     side = "Buy" if prediction == "Long" else "Sell"
                     execute_smart_trade(side, qty, current_price)
@@ -164,8 +148,9 @@ def run_loop():
                 last_prediction = prediction
 
         except Exception as e:
-            print(f"🚨 Errore Loop: {e}")
-            time.sleep(30)
+            # Mandiamo messaggio solo se l'errore persiste o è grave
+            print(f"Errore loop: {e}")
+            time.sleep(60)
 
 if __name__ == "__main__":
     run_loop()
