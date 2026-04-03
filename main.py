@@ -41,36 +41,33 @@ def is_position_open():
         return False
     except Exception as e:
         print(f"Errore nel controllo posizione: {e}")
-        return True # Prudenza: se c'è errore, facciamo finta sia aperta
+        return True # Per sicurezza non apriamo se c'è errore
 
 def get_daily_confidence():
     """Calcola la Confidence: (Prezzo attuale - Chiusura Ieri) / Chiusura Ieri"""
     try:
-        # Recupero kline Daily (limit 2: oggi e ieri)
         res = session.get_kline(category="linear", symbol=SYMBOL, interval="D", limit=2)
         if res['retCode'] != 0:
             print(f"Errore API Bybit: {res['retMsg']}")
             return None, None
             
         klines = res['result']['list']
-        # Bybit klines: [0] è candela attuale (aperta), [1] è la candela chiusa di ieri
+        # Bybit: [0] oggi (aperta), [1] ieri (chiusa)
         d_close_now = float(klines[0][4])      
         d_close_prev = float(klines[1][4]) 
         
         confidence = (d_close_now - d_close_prev) / d_close_prev
         return confidence, d_close_now
     except Exception as e:
-        print(f"Eccezione nel recupero dati kline: {e}")
+        print(f"Eccezione dati kline: {e}")
         return None, None
 
 def execute_smart_trade(side, qty, price):
     """Esegue ordine Limit con fallback Market dopo 120 secondi"""
     try:
-        # Calcolo TP e SL dinamico
         tp = price * (1 + TP_PERC) if side == "Buy" else price * (1 - TP_PERC)
         sl = price * (1 - SL_PERC) if side == "Buy" else price * (1 + SL_PERC)
 
-        # 1. Invio ordine LIMIT
         order = session.place_order(
             category="linear", symbol=SYMBOL, side=side, orderType="Limit",
             price=str(round(price, 2)), qty=str(qty),
@@ -80,71 +77,71 @@ def execute_smart_trade(side, qty, price):
         order_id = order['result']['orderId']
         send_telegram(f"🔔 Segnale {side} rilevato a {round(price, 2)}. Ordine LIMIT inviato.")
 
-        # 2. Attesa per il Fill
         time.sleep(120)
 
-        # 3. Controllo se l'ordine è ancora attivo
         check = session.get_open_orders(category="linear", symbol=SYMBOL, orderId=order_id)
         if check['result']['list']:
-            # Se ancora presente, cancelliamo e entriamo Market
             session.cancel_order(category="linear", symbol=SYMBOL, orderId=order_id)
             session.place_order(
                 category="linear", symbol=SYMBOL, side=side, orderType="Market",
                 qty=str(qty), takeProfit=str(round(tp, 2)), stopLoss=str(round(sl, 2)),
                 tpTriggerBy="MarkPrice", slTriggerBy="MarkPrice"
             )
-            send_telegram(f"⚡ Limit non eseguito. Entrato MARKET {side} (Qty: {qty})")
+            send_telegram(f"⚡ Entrato MARKET {side} (Qty: {qty})")
         else:
-            send_telegram(f"✅ Ordine LIMIT eseguito con successo!")
+            send_telegram(f"✅ Ordine LIMIT eseguito!")
             
     except Exception as e:
-        send_telegram(f"❌ Errore durante l'esecuzione del trade: {e}")
+        send_telegram(f"❌ Errore esecuzione: {e}")
 
 def run_loop():
     global last_prediction
     last_processed_time = "" 
-    print(f"🚀 Bot TrumpShipper Operativo. Scansione ogni 15 minuti su {SYMBOL}...")
+    print(f"🚀 Bot TrumpShipper Operativo. Scansione ogni 15m attiva.")
 
     while True:
-        # Uso timezone-aware objects per evitare i Warning di Render
         now = datetime.now(timezone.utc)
-        
-        # Identifico lo slot temporale (00, 15, 30, 45)
+        current_time_str = now.strftime("%H:%M:%S")
         current_slot = f"{now.hour}:{now.minute}"
         
-        # Scatta se siamo nel minuto giusto e abbiamo superato i primi 5 secondi di "assestamento"
+        # --- HEARTBEAT: Stampa ogni minuto al secondo 0 per confermare che è vivo ---
+        if now.second < 10:
+             # Stampiamo solo una volta al minuto nei primi 10 secondi
+             print(f"💓 [HEARTBEAT {current_time_str} UTC] Bot attivo. In attesa del prossimo slot TF15...")
+             time.sleep(10) # Salta avanti per non stampare 10 volte
+             continue
+
+        # --- LOGICA TF15 + 5 SECONDI ---
         if now.minute in [0, 15, 30, 45] and now.second >= 5:
             if current_slot != last_processed_time:
                 
-                print(f"--- Check delle {current_slot} UTC ---")
+                print(f"--- 🎯 CHECK SLOT {current_slot} UTC ---")
                 confidence, current_price = get_daily_confidence()
                 
                 if confidence is not None:
-                    # Logica Segnale (Replica Pine Script)
                     if confidence > DELTA_THRESHOLD:
                         prediction = "Long"
                     elif confidence < -DELTA_THRESHOLD:
                         prediction = "Short"
                     else:
-                        prediction = last_prediction # nz(prediction[1])
+                        prediction = last_prediction
 
-                    # Controllo se operare
                     if not is_position_open():
                         qty = round(FIXED_SIZE_USD / current_price, 2)
                         side = "Buy" if prediction == "Long" else "Sell"
                         execute_smart_trade(side, qty, current_price)
                     else:
-                        print(f"Analisi: {prediction} | Stato: Posizione già aperta. Attendo chiusura.")
+                        print(f"Analisi: {prediction} | Confidence: {round(confidence, 6)} | Stato: Posizione aperta.")
 
                     last_prediction = prediction
                     last_processed_time = current_slot
 
-        # Dorme 10 secondi per non saturare le API Rate Limits
+        # Dorme 10 secondi per evitare Rate Limits
         time.sleep(10)
 
 if __name__ == "__main__":
     try:
-        send_telegram("🤖 Bot TrumpShipper: Sistema riavviato e in scansione.")
+        send_telegram("🤖 Bot TrumpShipper: Sistema Riavviato. Check ogni 15m.")
         run_loop()
     except Exception as e:
-        print(f"Errore critico nel loop principale: {e}")
+        print(f"ERRORE CRITICO: {e}")
