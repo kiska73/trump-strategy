@@ -1,3 +1,4 @@
 pybit
 pandas
 requests
+pandas-ta
