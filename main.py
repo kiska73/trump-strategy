@@ -83,8 +83,12 @@ def get_current_position():
 def execute_trade(side, price):
     """Esegue l'ordine Market con TP e SL impostati"""
     try:
-        qty = round(FIXED_SIZE_USD / price, 3)
-        # Calcolo TP e SL
+        # --- CORREZIONE DECIMALI ---
+        # Per ETHUSDT la QTY accetta massimo 2 decimali (step 0.01)
+        raw_qty = FIXED_SIZE_USD / price
+        qty = float(f"{raw_qty:.2f}") 
+        
+        # I prezzi TP e SL per ETHUSDT accettano 2 decimali
         tp = round(price * (1 + TP_PERC), 2) if side == "Buy" else round(price * (1 - TP_PERC), 2)
         sl = round(price * (1 - SL_PERC), 2) if side == "Buy" else round(price * (1 + SL_PERC), 2)
         
@@ -103,15 +107,19 @@ def execute_trade(side, price):
         if order.get('retCode') == 0:
             emoji = "🟢" if side == "Buy" else "🔴"
             msg = (f"{emoji} <b>NUOVO ORDINE {side.upper()}</b>\n"
-                   f"Prezzo: {price}\n"
+                   f"Asset: {SYMBOL}\n"
+                   f"Quantità: {qty}\n"
+                   f"Prezzo Entry: {price}\n"
                    f"TP: {tp} | SL: {sl}")
             send_telegram(msg)
             print(f"✅ Ordine {side} eseguito!")
         else:
-            print(f"❌ Errore Bybit: {order.get('retMsg')}")
+            err_msg = order.get('retMsg')
+            print(f"❌ Errore Bybit: {err_msg}")
+            send_telegram(f"❌ <b>Errore Bybit:</b> {err_msg}")
             
     except Exception as e:
-        send_telegram(f"🚨 Errore durante l'esecuzione del trade: {e}")
+        send_telegram(f"🚨 Errore critico esecuzione: {e}")
 
 def run_strategy():
     print(f"🚀 BOT ONLINE | {SYMBOL} | TF {TF_MINUTES}m")
@@ -124,9 +132,8 @@ def run_strategy():
             now = datetime.now(timezone.utc)
             
             # --- SINCRONIZZAZIONE 5 MINUTI ---
-            # Calcola quanto manca alla fine della candela + 3 secondi di sicurezza
-            seconds_to_wait = (TF_MINUTES - (now.minute % TF_MINUTES)) * 60 - now.second + 3
-            if seconds_to_wait <= 0: seconds_to_wait = 3
+            seconds_to_wait = (TF_MINUTES - (now.minute % TF_MINUTES)) * 60 - now.second + 2
+            if seconds_to_wait <= 0: seconds_to_wait = 2
             
             print(f"⏳ In attesa della prossima candela... ({seconds_to_wait}s)")
             time.sleep(seconds_to_wait)
@@ -148,15 +155,14 @@ def run_strategy():
 
             # 2. LOGICA DI INGRESSO (Solo se non abbiamo già una posizione)
             if size == 0:
-                # Condizioni EMA
                 ema_long_ok = not USE_EMA_FILTER or current_price > ema_val
                 ema_short_ok = not USE_EMA_FILTER or current_price < ema_val
 
-                # LONG: Prezzo > Chiusura Ieri E Filtro EMA OK
+                # LONG
                 if current_price > daily_yesterday and ema_long_ok:
                     execute_trade("Buy", current_price)
                 
-                # SHORT: Prezzo < Chiusura Ieri E Filtro EMA OK
+                # SHORT
                 elif current_price < daily_yesterday and ema_short_ok:
                     execute_trade("Sell", current_price)
 
