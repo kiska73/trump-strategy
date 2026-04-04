@@ -1,7 +1,8 @@
 import time
 import requests
 import os
-import random
+import pandas as pd
+import pandas_ta as ta  # Ti serve questa libreria: pip install pandas-ta
 from datetime import datetime, timezone
 from pybit.unified_trading import HTTP
 
@@ -15,10 +16,12 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
 SYMBOL = "ETHUSDT"
 FIXED_SIZE_USD = 1000 
-DELTA_THRESHOLD = 0.0001
-SL_PERC = 1.3 / 100
 TP_PERC = 6.0 / 100
-TF_MINUTES = 15  
+SL_PERC = 2.0 / 100
+TF_MINUTES = 5  # Timeframe 5 minuti
+EMA_LENGTH = 20
+USE_EMA_FILTER = True
+
 # =================================================================
 
 session = HTTP(
@@ -28,148 +31,102 @@ session = HTTP(
     recv_window=10000
 )
 
-last_prediction = "Long" 
-last_trade_day = datetime.now(timezone.utc).day
-
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=10)
-    except:
-        pass
+    try: requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=10)
+    except: pass
 
-def get_current_position_info():
+def get_data():
+    """Recupera chiusura daily di ieri e candele 5m per EMA"""
+    try:
+        # 1. Chiusura Daily di ieri
+        d_res = session.get_kline(category="linear", symbol=SYMBOL, interval="D", limit=2)
+        daily_close_yesterday = float(d_res['result']['list'][1][4])
+
+        # 2. Candele 5m per calcolo EMA
+        m5_res = session.get_kline(category="linear", symbol=SYMBOL, interval=str(TF_MINUTES), limit=100)
+        df = pd.DataFrame(m5_res['result']['list'], columns=['time', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+        df['close'] = df['close'].astype(float)
+        
+        # Invertiamo il dataframe perché Bybit restituisce i dati dalla più recente alla più vecchia
+        df = df.iloc[::-1].reset_index(drop=True)
+        
+        # Calcolo EMA
+        ema_series = ta.ema(df['close'], length=EMA_LENGTH)
+        current_ema = ema_series.iloc[-1]
+        current_price = df['close'].iloc[-1]
+
+        return daily_close_yesterday, current_ema, current_price
+    except Exception as e:
+        print(f"🚨 Errore recupero dati: {e}")
+        return None, None, None
+
+def get_position():
     try:
         res = session.get_positions(category="linear", symbol=SYMBOL)
         if res.get('retCode') == 0:
-            for pos in res['result']['list']:
-                size = float(pos.get('size', 0))
-                if size > 0:
-                    return pos.get('side'), size, float(pos.get('avgPrice', 0)), float(pos.get('markPrice', 0))
-        return None, 0, 0, 0
-    except Exception as e:
-        print(f"⚠️ Errore check posizione: {e}")
-        return None, 0, 0, 0
+            pos = res['result']['list'][0]
+            return pos.get('side'), float(pos.get('size', 0))
+        return None, 0
+    except: return None, 0
 
-def force_daily_reset():
+def execute_trade(side, price):
     try:
-        side, size, entry_price, mark_price = get_current_position_info()
-        if side and size > 0:
-            # Calcolo % netta del movimento di prezzo
-            if side == "Buy":
-                price_diff_perc = ((mark_price - entry_price) / entry_price) * 100
-            else:
-                price_diff_perc = ((entry_price - mark_price) / entry_price) * 100
-            
-            exit_side = "Sell" if side == "Buy" else "Buy"
-            session.place_order(
-                category="linear", symbol=SYMBOL, side=exit_side, 
-                orderType="Market", qty=str(size)
-            )
-            
-            emoji = "🤑" if price_diff_perc > 0 else "🩸"
-            sign = "+" if price_diff_perc > 0 else ""
-            
-            msg = (f"🌅 <b>RESET GIORNALIERO</b>\n"
-                   f"Chiusa pos: <b>{side.upper()}</b>\n"
-                   f"Risultato: <b>{sign}{round(price_diff_perc, 2)}%</b> {emoji}")
-            
-            send_telegram(msg)
-            time.sleep(5)
-    except Exception as e:
-        send_telegram(f"🚨 Errore reset: {e}")
-
-def get_daily_confidence():
-    try:
-        time.sleep(random.uniform(0.5, 1.5))
-        res = session.get_kline(category="linear", symbol=SYMBOL, interval="D", limit=2)
-        if res.get('retCode') != 0: return None, None
-        klines = res['result']['list']
-        d_close_now = float(klines[0][4])      
-        d_close_prev = float(klines[1][4]) 
-        confidence = (d_close_now - d_close_prev) / d_close_prev
-        return confidence, d_close_now
-    except Exception as e:
-        print(f"🚨 Eccezione Klines: {e}")
-        return None, None
-
-def execute_smart_trade(side, qty, price):
-    try:
-        tp = price * (1 + TP_PERC) if side == "Buy" else price * (1 - TP_PERC)
-        sl = price * (1 - SL_PERC) if side == "Buy" else price * (1 + SL_PERC)
-        direction = "🟢 LONG" if side == "Buy" else "🔴 SHORT"
-
-        order = session.place_order(
-            category="linear", symbol=SYMBOL, side=side, orderType="Limit",
-            price=str(round(price, 2)), qty=str(round(qty, 3)),
-            takeProfit=str(round(tp, 2)), stopLoss=str(round(sl, 2)),
-            tpTriggerBy="MarkPrice", slTriggerBy="MarkPrice", timeInForce="GTC"
-        )
+        qty = round(FIXED_SIZE_USD / price, 3)
+        tp = round(price * (1 + TP_PERC), 2) if side == "Buy" else round(price * (1 - TP_PERC), 2)
+        sl = round(price * (1 - SL_PERC), 2) if side == "Buy" else round(price * (1 + SL_PERC), 2)
         
+        order = session.place_order(
+            category="linear", symbol=SYMBOL, side=side, orderType="Market",
+            qty=str(qty), takeProfit=str(tp), stopLoss=str(sl),
+            tpTriggerBy="MarkPrice", slTriggerBy="MarkPrice"
+        )
         if order.get('retCode') == 0:
-            order_id = order['result']['orderId']
-            send_telegram(f"🎯 <b>SEGNALE {TF_MINUTES}m</b>\n<b>{direction}</b>\nLimit: {round(price, 2)}\nQty: {round(qty, 3)}")
-            
-            time.sleep(45) 
-            check = session.get_open_orders(category="linear", symbol=SYMBOL, orderId=order_id)
-            
-            if check.get('retCode') == 0 and len(check['result']['list']) > 0:
-                session.cancel_order(category="linear", symbol=SYMBOL, orderId=order_id)
-                session.place_order(
-                    category="linear", symbol=SYMBOL, side=side, orderType="Market",
-                    qty=str(round(qty, 3)), takeProfit=str(round(tp, 2)), stopLoss=str(round(sl, 2)),
-                    tpTriggerBy="MarkPrice", slTriggerBy="MarkPrice"
-                )
-                send_telegram(f"⚡ <b>Limit cancellato.</b> Entrato a Mercato.")
-            else:
-                send_telegram(f"✅ <b>Limit Fillato.</b> Siamo in posizione.")
-        else:
-            send_telegram(f"❌ <b>Bybit:</b> {order.get('retMsg')}")
+            icon = "🟢" if side == "Buy" else "🔴"
+            send_telegram(f"{icon} <b>ENTRY {side}</b>\nPrezzo: {price}\nTP: {tp} | SL: {sl}")
     except Exception as e:
         send_telegram(f"🚨 Errore trade: {e}")
 
-def run_loop():
-    global last_prediction, last_trade_day
-    
-    send_telegram(f"🚀 <b>BOT ONLINE</b>\n<b>Coppia:</b> {SYMBOL} | <b>TF:</b> {TF_MINUTES}m")
-    print(f"🤖 Bot Online | {SYMBOL}")
+def run_strategy():
+    print(f"🤖 Bot avviato su {SYMBOL} (TF 5m)")
+    last_day = datetime.now(timezone.utc).day
 
     while True:
-        try:
-            now = datetime.now(timezone.utc)
-            
-            if now.day != last_trade_day:
-                force_daily_reset()
-                last_trade_day = now.day
-            
-            minutes_to_next = TF_MINUTES - (now.minute % TF_MINUTES)
-            seconds_to_wait = (minutes_to_next * 60) - now.second + 5 
-            
-            if seconds_to_wait > 0:
-                time.sleep(seconds_to_wait)
+        now = datetime.now(timezone.utc)
+        
+        # --- LOGICA DI TIMING: Esecuzione ogni 5 min + 3 secondi ---
+        # Calcola quanti secondi mancano alla prossima chiusura candela (05, 10, 15...)
+        next_tick = (TF_MINUTES - (now.minute % TF_MINUTES)) * 60 - now.second + 3
+        if next_tick <= 0: next_tick = 3 # Sicurezza per non dormire tempi negativi
+        
+        print(f"⏳ In attesa della chiusura candela... (prossimo check tra {next_tick}s)")
+        time.sleep(next_tick)
 
-            confidence, current_price = get_daily_confidence()
-            if confidence is not None:
-                if confidence > DELTA_THRESHOLD:
-                    prediction = "Long"
-                elif confidence < -DELTA_THRESHOLD:
-                    prediction = "Short"
-                else:
-                    prediction = last_prediction
+        # --- AZIONI POST-CHIUSURA ---
+        daily_yesterday, ema_val, current_price = get_data()
+        if daily_yesterday is None: continue
 
-                side_active, _, _, _ = get_current_position_info()
-                
-                if side_active is None:
-                    qty = FIXED_SIZE_USD / current_price
-                    side_to_open = "Buy" if prediction == "Long" else "Sell"
-                    execute_smart_trade(side_to_open, qty, current_price)
-                
-                last_prediction = prediction
+        side_active, size = get_position()
 
-        except Exception as e:
-            print(f"Errore loop: {e}")
-            time.sleep(30)
+        # 1. Reset Giornaliero (se è cambiato il giorno, chiudi tutto)
+        current_day = datetime.now(timezone.utc).day
+        if current_day != last_day:
+            if size > 0:
+                session.place_order(category="linear", symbol=SYMBOL, side="Sell" if side_active=="Buy" else "Buy", 
+                                    orderType="Market", qty=str(size))
+                send_telegram("🌅 <b>Reset Giornaliero:</b> Posizioni chiuse.")
+            last_day = current_day
+
+        # 2. Logica di Ingresso (se non ci sono posizioni aperte)
+        if size == 0:
+            ema_long_ok = not USE_EMA_FILTER or current_price > ema_val
+            ema_short_ok = not USE_EMA_FILTER or current_price < ema_val
+
+            if current_price > daily_yesterday and ema_long_ok:
+                execute_trade("Buy", current_price)
+            elif current_price < daily_yesterday and ema_short_ok:
+                execute_trade("Sell", current_price)
 
 if __name__ == "__main__":
-    run_loop()
+    run_strategy()
