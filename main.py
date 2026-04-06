@@ -32,7 +32,7 @@ last_closed_trade_id = None
 
 # ------------------------------------------------
 
-def send_telegram(message):
+def send_telegram(msg):
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -44,11 +44,34 @@ def send_telegram(message):
             url,
             json={
                 "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-                "parse_mode": "HTML"
+                "text": msg
             },
             timeout=10
         )
+    except:
+        pass
+
+# ------------------------------------------------
+# EVITA FALSO SL ALL'AVVIO
+# ------------------------------------------------
+
+def init_last_closed_trade():
+
+    global last_closed_trade_id
+
+    try:
+
+        res = session.get_closed_pnl(
+            category="linear",
+            symbol=SYMBOL,
+            limit=1
+        )
+
+        trades = res["result"]["list"]
+
+        if trades:
+            last_closed_trade_id = trades[0]["orderId"]
+
     except:
         pass
 
@@ -80,7 +103,9 @@ def get_current_position():
         return None, 0, 0, 0
 
     except Exception as e:
+
         print("Errore posizione:", e)
+
         return None, 0, 0, 0
 
 # ------------------------------------------------
@@ -112,12 +137,13 @@ def get_last_closed_trade():
         last_closed_trade_id = trade_id
 
         pnl = float(trade["closedPnl"])
-        side = trade["side"]
 
-        return side, pnl
+        return pnl
 
     except Exception as e:
+
         print("Errore closed pnl:", e)
+
         return None
 
 # ------------------------------------------------
@@ -126,18 +152,16 @@ def get_data():
 
     try:
 
-        d_res = session.get_kline(
+        d = session.get_kline(
             category="linear",
             symbol=SYMBOL,
             interval="D",
             limit=2
         )
 
-        daily_close_yesterday = float(
-            d_res["result"]["list"][1][4]
-        )
+        daily_close = float(d["result"]["list"][1][4])
 
-        m5_res = session.get_kline(
+        m = session.get_kline(
             category="linear",
             symbol=SYMBOL,
             interval=str(TF_MINUTES),
@@ -145,7 +169,7 @@ def get_data():
         )
 
         df = pd.DataFrame(
-            m5_res["result"]["list"],
+            m["result"]["list"],
             columns=[
                 "time","open","high","low",
                 "close","volume","turnover"
@@ -162,7 +186,7 @@ def get_data():
         ).mean()
 
         return (
-            daily_close_yesterday,
+            daily_close,
             df["ema"].iloc[-1],
             df["close"].iloc[-1]
         )
@@ -180,6 +204,7 @@ def execute_trade(side, price):
     try:
 
         raw_qty = FIXED_SIZE_USD / price
+
         qty = float(f"{raw_qty:.2f}")
 
         tp = round(
@@ -197,8 +222,8 @@ def execute_trade(side, price):
         )
 
         send_telegram(
-            f"🔍 Bias {side}\n"
-            f"Limit a {price:.2f}"
+            f"Bias {side}\n"
+            f"Limit {price:.2f}"
         )
 
         order = session.place_order(
@@ -213,9 +238,9 @@ def execute_trade(side, price):
         )
 
         if order["retCode"] != 0:
-            send_telegram(
-                f"❌ Errore ordine:\n{order['retMsg']}"
-            )
+
+            send_telegram(order["retMsg"])
+
             return
 
         order_id = order["result"]["orderId"]
@@ -231,11 +256,13 @@ def execute_trade(side, price):
         if check["result"]["list"]:
 
             try:
+
                 session.cancel_order(
                     category="linear",
                     symbol=SYMBOL,
                     orderId=order_id
                 )
+
             except:
                 pass
 
@@ -250,7 +277,7 @@ def execute_trade(side, price):
             )
 
             send_telegram(
-                f"⚡ Entrata Market\n"
+                f"Entrata Market\n"
                 f"{side} {qty} ETH\n"
                 f"TP {tp}\nSL {sl}"
             )
@@ -258,7 +285,7 @@ def execute_trade(side, price):
         else:
 
             send_telegram(
-                f"💎 Limit Fill\n"
+                f"Limit Fill\n"
                 f"{side} {qty} ETH\n"
                 f"Entry {price:.2f}\n"
                 f"TP {tp}\nSL {sl}"
@@ -266,13 +293,15 @@ def execute_trade(side, price):
 
     except Exception as e:
 
-        send_telegram(f"🚨 Errore trade: {e}")
+        send_telegram(f"Errore trade {e}")
 
 # ------------------------------------------------
 
 def run_strategy():
 
-    send_telegram("🤖 Bot Online")
+    init_last_closed_trade()
+
+    send_telegram("Bot Online")
 
     last_day = datetime.now(timezone.utc).day
 
@@ -292,31 +321,29 @@ def run_strategy():
 
             time.sleep(wait)
 
-            closed = get_last_closed_trade()
+            closed_pnl = get_last_closed_trade()
 
-            if closed:
+            if closed_pnl is not None:
 
-                side, pnl = closed
+                pnl_perc = (closed_pnl / FIXED_SIZE_USD) * 100
 
-                pnl_perc = (pnl / FIXED_SIZE_USD) * 100
-
-                if pnl > 0:
+                if pnl_perc > 0:
 
                     send_telegram(
-                        f"✅ TP preso\n"
+                        f"TP preso\n"
                         f"PNL {pnl_perc:.2f}%"
                     )
 
                 else:
 
                     send_telegram(
-                        f"❌ SL preso\n"
+                        f"SL preso\n"
                         f"PNL {pnl_perc:.2f}%"
                     )
 
-            daily_yesterday, ema_val, price = get_data()
+            daily_close, ema_val, price = get_data()
 
-            if daily_yesterday is None:
+            if daily_close is None:
                 continue
 
             side_active, size, entry, pnl = get_current_position()
@@ -337,31 +364,25 @@ def run_strategy():
                         qty=str(size)
                     )
 
-                    send_telegram(
-                        "🌅 Reset Daily\n"
-                        "Posizione chiusa"
-                    )
+                    send_telegram("Reset Daily chiusura posizione")
 
                 else:
 
-                    send_telegram(
-                        "🌅 Reset Daily\n"
-                        "Nessuna posizione"
-                    )
+                    send_telegram("Reset Daily")
 
                 last_day = current_day
 
             if size == 0:
 
                 if (
-                    price > daily_yesterday
+                    price > daily_close
                     and (not USE_EMA_FILTER or price > ema_val)
                 ):
 
                     execute_trade("Buy", price)
 
                 elif (
-                    price < daily_yesterday
+                    price < daily_close
                     and (not USE_EMA_FILTER or price < ema_val)
                 ):
 
@@ -371,12 +392,13 @@ def run_strategy():
 
                 print(
                     f"{side_active} attiva | "
-                    f"PNL {pnl:.2f} USDT"
+                    f"PNL {pnl:.2f}"
                 )
 
         except Exception as e:
 
             print("Errore loop:", e)
+
             time.sleep(10)
 
 # ------------------------------------------------
