@@ -26,7 +26,7 @@ session = HTTP(
     recv_window=20000
 )
 
-# Variabili di stato
+# Variabili di stato per evitare trade multipli nello stesso blocco 4H
 current_bias_block = None
 trade_done_in_block = False
 
@@ -40,6 +40,7 @@ def send_telegram(msg):
     except: pass
 
 def get_current_position():
+    """Ritorna Side, Size, EntryPrice, PnL della posizione aperta"""
     try:
         res = session.get_positions(category="linear", symbol=SYMBOL)
         if res["retCode"] == 0:
@@ -51,32 +52,33 @@ def get_current_position():
     except: return None, 0, 0, 0
 
 def get_data_signals():
-    """Recupera Bias 4H e indicatori TF1 basati sulla candela APPENA CHIUSA"""
+    """Recupera Bias 4H e EMA18 basati sull'ultima candela CHIUSA"""
     try:
-        # 1. BIAS 4H: Chiusura della candela 4H precedente
+        # 1. BIAS 4H: Chiusura della candela 4H precedente (quella già finita)
         d = session.get_kline(category="linear", symbol=SYMBOL, interval="240", limit=2)
         bias_4h_val = float(d["result"]["list"][1][4]) 
 
-        # 2. DATI TF1: Analisi tecnica
-        m = session.get_kline(category="linear", symbol=SYMBOL, interval="1", limit=100)
+        # 2. DATI TF1: Analisi su grafico a 1 minuto
+        m = session.get_kline(category="linear", symbol=SYMBOL, interval="1", limit=150)
         df = pd.DataFrame(m["result"]["list"], columns=["time","open","high","low","close","vol","turnover"])
         df["close"] = df["close"].astype(float)
         df = df.iloc[::-1].reset_index(drop=True)
         
-        # Calcolo EMA sulla serie
+        # Calcolo EMA 18
         df["ema"] = df["close"].ewm(span=EMA_LENGTH, adjust=False).mean()
 
-        # PRENDIAMO IL VALORE DELLA CANDELA CHIUSA (PENULTIMA NELLA LISTA)
-        # La iloc[-1] è la candela appena nata, la iloc[-2] è quella delle 18:00 (se sono le 18:01)
+        # PRENDIAMO I VALORI DELLA CANDELA CHIUSA (indice -2)
+        # Il bot gira al minuto 18:01:02, quindi analizza la candela chiusa delle 18:00
         closed_candle_price = df["close"].iloc[-2]
         ema_val = df["ema"].iloc[-2]
         
         return bias_4h_val, ema_val, closed_candle_price
     except Exception as e:
-        print(f"Errore recupero dati: {e}")
+        print(f"Errore recupero dati API: {e}")
         return None, None, None
 
 def execute_trade(side, price):
+    """Esegue l'ordine Market con TP e SL impostati"""
     try:
         qty = round(FIXED_SIZE_USD / price, 3)
         tp = round(price * (1 + TP_PERC) if side == "Buy" else price * (1 - TP_PERC), 2)
@@ -87,69 +89,74 @@ def execute_trade(side, price):
             qty=str(qty), takeProfit=str(tp), stopLoss=str(sl)
         )
         if order["retCode"] == 0:
-            send_telegram(f"🔥 Entry {side} @ {price}\nTP: {tp} | SL: {sl}")
+            send_telegram(f"🚀 ORDINE {side} ESEGUITO\nPrezzo: {price}\nTP: {tp} | SL: {sl}")
             return True
         else:
-            print(f"Errore Bybit: {order['retMsg']}")
+            print(f"Errore Bybit nell'ordine: {order['retMsg']}")
             return False
     except Exception as e:
-        print(f"Errore order execution: {e}")
+        print(f"Eccezione durante esecuzione ordine: {e}")
         return False
 
 def run_strategy():
     global current_bias_block, trade_done_in_block
-    send_telegram("Bot Trump 4H (TF1 - Fixed) Online")
+    send_telegram("🤖 Bot Trump 4H (Versione Anti-Whipsaw) Attivo")
 
     while True:
         try:
             now = datetime.now(timezone.utc)
             
-            # Calcolo blocco 4H
+            # Identificazione del blocco 4H corrente (00, 04, 08, 12, 16, 20)
             block_start_hour = (now.hour // 4) * 4
             this_block = now.replace(hour=block_start_hour, minute=0, second=0, microsecond=0)
             
-            # Reset al cambio di blocco 4H
+            # Se siamo in un nuovo blocco di 4 ore, resettiamo il flag del trade
             if current_bias_block != this_block:
                 current_bias_block = this_block
                 trade_done_in_block = False
-                send_telegram(f"Nuovo Bias H4 caricato per le ore: {this_block.strftime('%H:%M')}")
+                send_telegram(f"🕒 Cambio blocco 4H: {this_block.strftime('%H:%M')} UTC. Operatività ripristinata.")
 
-            # Sincronizzazione: Aspetta l'inizio del minuto + 2 secondi di buffer
+            # Attesa inizio minuto + 2 secondi per sincronizzazione server
             secs_to_wait = 60 - datetime.now().second
             time.sleep(secs_to_wait + 2) 
 
-            # Recupero segnali sulla candela chiusa
+            # Recupero dati tecnici
             bias_val, ema_val, last_close = get_data_signals()
             if bias_val is None: continue
 
             side_active, size, entry, pnl = get_current_position()
 
-            # --- CHIUSURA PREVENTIVA (Fine blocco 4H) ---
+            # --- LOGICA CHIUSURA FINE BLOCCO (Opzionale) ---
+            # Chiude forzatamente se siamo a 2 minuti dal cambio bias per evitare incertezze
             next_block = this_block + timedelta(hours=4)
             time_to_reset = (next_block - datetime.now(timezone.utc)).total_seconds()
 
-            if size > 0 and time_to_reset <= 120: # 2 minuti alla fine
+            if size > 0 and time_to_reset <= 120:
                 exit_side = "Sell" if side_active == "Buy" else "Buy"
                 session.place_order(category="linear", symbol=SYMBOL, side=exit_side, orderType="Market", qty=str(size))
-                send_telegram("Chiusura automatica fine blocco 4H")
-                trade_done_in_block = True 
+                send_telegram("⚠️ Chiusura posizione preventiva per fine blocco 4H")
+                trade_done_in_block = True # Blocca rientri nell'ultimo minuto
 
-            # --- LOGICA INGRESSO (Candela Chiusa) ---
+            # --- LOGICA INGRESSO ---
+            # Entra solo se NON c'è una posizione aperta E se NON è già stato fatto un trade in questo blocco
             if size == 0 and not trade_done_in_block:
-                # LONG: Prezzo Chiuso > Bias 4H E Prezzo Chiuso > EMA18
+                
+                # CONDIZIONE LONG: Chiusura TF1 > Bias 4H E Chiusura TF1 > EMA18
                 if last_close > bias_val and last_close > ema_val:
                     if execute_trade("Buy", last_close):
                         trade_done_in_block = True
                 
-                # SHORT: Prezzo Chiuso < Bias 4H E Prezzo Chiuso < EMA18
+                # CONDIZIONE SHORT: Chiusura TF1 < Bias 4H E Chiusura TF1 < EMA18
                 elif last_close < bias_val and last_close < ema_val:
                     if execute_trade("Sell", last_close):
                         trade_done_in_block = True
 
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Close: {last_close} | Bias: {bias_val} | EMA: {ema_val:.2f} | Done: {trade_done_in_block}")
+            # Debug a console
+            status = "In attesa" if not trade_done_in_block else "Blocco completato"
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Prazzo: {last_close} | Bias: {bias_val} | EMA: {ema_val:.2f} | Stato: {status}")
 
         except Exception as e:
-            print(f"Errore loop: {e}")
+            print(f"Errore nel loop principale: {e}")
             time.sleep(10)
 
 if __name__ == "__main__":
