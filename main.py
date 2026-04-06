@@ -2,7 +2,7 @@ import time
 import requests
 import os
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pybit.unified_trading import HTTP
 
 # --- CONFIGURAZIONE ---
@@ -14,12 +14,11 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 SYMBOL = "ETHUSDT"
 FIXED_SIZE_USD = 1000
 
-TP_PERC = 6.0 / 100
-SL_PERC = 1.8 / 100
-
-TF_MINUTES = 5
-EMA_LENGTH = 20
-USE_EMA_FILTER = True
+# Nuovi Parametri richiesti
+TP_PERC = 3.0 / 100
+SL_PERC = 1.5 / 100
+EMA_LENGTH = 18
+TF_MINUTES = 1  # Analisi su TF1
 
 session = HTTP(
     testnet=False,
@@ -28,380 +27,122 @@ session = HTTP(
     recv_window=20000
 )
 
-last_closed_trade_id = None
+# Variabile per tracciare il blocco attuale e impedire rientri
+current_bias_block = None
+trade_done_in_block = False
 
 # ------------------------------------------------
 
 def send_telegram(msg):
-
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
     try:
-        requests.post(
-            url,
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": msg
-            },
-            timeout=10
-        )
-    except:
-        pass
-
-# ------------------------------------------------
-# EVITA FALSO SL ALL'AVVIO
-# ------------------------------------------------
-
-def init_last_closed_trade():
-
-    global last_closed_trade_id
-
-    try:
-
-        res = session.get_closed_pnl(
-            category="linear",
-            symbol=SYMBOL,
-            limit=1
-        )
-
-        trades = res["result"]["list"]
-
-        if trades:
-            last_closed_trade_id = trades[0]["orderId"]
-
-    except:
-        pass
-
-# ------------------------------------------------
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+    except: pass
 
 def get_current_position():
-
     try:
-
-        res = session.get_positions(
-            category="linear",
-            symbol=SYMBOL
-        )
-
+        res = session.get_positions(category="linear", symbol=SYMBOL)
         if res["retCode"] == 0:
-
             for pos in res["result"]["list"]:
-
                 size = float(pos["size"])
-
                 if size > 0:
-                    return (
-                        pos["side"],
-                        size,
-                        float(pos["avgPrice"]),
-                        float(pos["unrealisedPnl"])
-                    )
-
+                    return pos["side"], size, float(pos["avgPrice"]), float(pos["unrealisedPnl"])
         return None, 0, 0, 0
+    except: return None, 0, 0, 0
 
-    except Exception as e:
-
-        print("Errore posizione:", e)
-
-        return None, 0, 0, 0
-
-# ------------------------------------------------
-
-def get_last_closed_trade():
-
-    global last_closed_trade_id
-
+def get_data_4h():
+    """Recupera la chiusura dell'ultima candela 4H e i dati TF1 per EMA"""
     try:
+        # Bias 4H
+        d = session.get_kline(category="linear", symbol=SYMBOL, interval="240", limit=2)
+        bias_4h_close = float(d["result"]["list"][1][4]) # Chiusura candela 4H precedente
 
-        res = session.get_closed_pnl(
-            category="linear",
-            symbol=SYMBOL,
-            limit=1
-        )
-
-        trades = res["result"]["list"]
-
-        if not trades:
-            return None
-
-        trade = trades[0]
-
-        trade_id = trade["orderId"]
-
-        if trade_id == last_closed_trade_id:
-            return None
-
-        last_closed_trade_id = trade_id
-
-        pnl = float(trade["closedPnl"])
-
-        return pnl
-
-    except Exception as e:
-
-        print("Errore closed pnl:", e)
-
-        return None
-
-# ------------------------------------------------
-
-def get_data():
-
-    try:
-
-        d = session.get_kline(
-            category="linear",
-            symbol=SYMBOL,
-            interval="D",
-            limit=2
-        )
-
-        daily_close = float(d["result"]["list"][1][4])
-
-        m = session.get_kline(
-            category="linear",
-            symbol=SYMBOL,
-            interval=str(TF_MINUTES),
-            limit=100
-        )
-
-        df = pd.DataFrame(
-            m["result"]["list"],
-            columns=[
-                "time","open","high","low",
-                "close","volume","turnover"
-            ]
-        )
-
+        # Dati TF1 per EMA
+        m = session.get_kline(category="linear", symbol=SYMBOL, interval="1", limit=100)
+        df = pd.DataFrame(m["result"]["list"], columns=["time","open","high","low","close","vol","turnover"])
         df["close"] = df["close"].astype(float)
-
         df = df.iloc[::-1].reset_index(drop=True)
-
-        df["ema"] = df["close"].ewm(
-            span=EMA_LENGTH,
-            adjust=False
-        ).mean()
-
-        return (
-            daily_close,
-            df["ema"].iloc[-1],
-            df["close"].iloc[-1]
-        )
-
+        
+        ema = df["close"].ewm(span=EMA_LENGTH, adjust=False).mean().iloc[-1]
+        current_price = df["close"].iloc[-1]
+        
+        return bias_4h_close, ema, current_price
     except Exception as e:
-
-        print("Errore dati:", e)
-
+        print(f"Errore dati: {e}")
         return None, None, None
 
-# ------------------------------------------------
-
 def execute_trade(side, price):
-
     try:
-
-        raw_qty = FIXED_SIZE_USD / price
-
-        qty = float(f"{raw_qty:.2f}")
-
-        tp = round(
-            price * (1 + TP_PERC)
-            if side == "Buy"
-            else price * (1 - TP_PERC),
-            2
-        )
-
-        sl = round(
-            price * (1 - SL_PERC)
-            if side == "Buy"
-            else price * (1 + SL_PERC),
-            2
-        )
-
-        send_telegram(
-            f"Bias {side}\n"
-            f"Limit {price:.2f}"
-        )
+        qty = round(FIXED_SIZE_USD / price, 3)
+        tp = round(price * (1 + TP_PERC) if side == "Buy" else price * (1 - TP_PERC), 2)
+        sl = round(price * (1 - SL_PERC) if side == "Buy" else price * (1 + SL_PERC), 2)
 
         order = session.place_order(
-            category="linear",
-            symbol=SYMBOL,
-            side=side,
-            orderType="Limit",
-            qty=str(qty),
-            price=str(round(price,2)),
-            takeProfit=str(tp),
-            stopLoss=str(sl)
+            category="linear", symbol=SYMBOL, side=side, orderType="Market",
+            qty=str(qty), takeProfit=str(tp), stopLoss=str(sl)
         )
-
-        if order["retCode"] != 0:
-
-            send_telegram(order["retMsg"])
-
-            return
-
-        order_id = order["result"]["orderId"]
-
-        time.sleep(120)
-
-        check = session.get_open_orders(
-            category="linear",
-            symbol=SYMBOL,
-            orderId=order_id
-        )
-
-        if check["result"]["list"]:
-
-            try:
-
-                session.cancel_order(
-                    category="linear",
-                    symbol=SYMBOL,
-                    orderId=order_id
-                )
-
-            except:
-                pass
-
-            session.place_order(
-                category="linear",
-                symbol=SYMBOL,
-                side=side,
-                orderType="Market",
-                qty=str(qty),
-                takeProfit=str(tp),
-                stopLoss=str(sl)
-            )
-
-            send_telegram(
-                f"Entrata Market\n"
-                f"{side} {qty} ETH\n"
-                f"TP {tp}\nSL {sl}"
-            )
-
-        else:
-
-            send_telegram(
-                f"Limit Fill\n"
-                f"{side} {qty} ETH\n"
-                f"Entry {price:.2f}\n"
-                f"TP {tp}\nSL {sl}"
-            )
-
+        if order["retCode"] == 0:
+            send_telegram(f"🔥 Entry {side} @ {price}\nTP: {tp} | SL: {sl}")
+            return True
+        return False
     except Exception as e:
-
-        send_telegram(f"Errore trade {e}")
-
-# ------------------------------------------------
+        print(f"Errore order: {e}")
+        return False
 
 def run_strategy():
-
-    init_last_closed_trade()
-
-    send_telegram("Bot Online")
-
-    last_day = datetime.now(timezone.utc).day
+    global current_bias_block, trade_done_in_block
+    send_telegram("Bot Trump 4H (TF1) Online")
 
     while True:
-
         try:
-
             now = datetime.now(timezone.utc)
+            # Calcolo del blocco 4H attuale (00, 04, 08, 12, 16, 20)
+            block_start_hour = (now.hour // 4) * 4
+            this_block = now.replace(hour=block_start_hour, minute=0, second=0, microsecond=0)
+            
+            # Reset se cambiamo blocco di 4 ore
+            if current_bias_block != this_block:
+                current_bias_block = this_block
+                trade_done_in_block = False
+                send_telegram(f"Nuovo Bias H4: {this_block.strftime('%H:%M')}")
 
-            wait = (
-                (TF_MINUTES - (now.minute % TF_MINUTES)) * 60
-                - now.second + 2
-            )
+            # Sleep fino al prossimo minuto spaccato
+            time.sleep(60 - datetime.now().second)
 
-            if wait <= 0:
-                wait = 2
-
-            time.sleep(wait)
-
-            closed_pnl = get_last_closed_trade()
-
-            if closed_pnl is not None:
-
-                pnl_perc = (closed_pnl / FIXED_SIZE_USD) * 100
-
-                if pnl_perc > 0:
-
-                    send_telegram(
-                        f"TP preso\n"
-                        f"PNL {pnl_perc:.2f}%"
-                    )
-
-                else:
-
-                    send_telegram(
-                        f"SL preso\n"
-                        f"PNL {pnl_perc:.2f}%"
-                    )
-
-            daily_close, ema_val, price = get_data()
-
-            if daily_close is None:
-                continue
+            bias_val, ema_val, price = get_data_4h()
+            if bias_val is None: continue
 
             side_active, size, entry, pnl = get_current_position()
 
-            current_day = datetime.now(timezone.utc).day
+            # --- LOGICA CHIUSURA FORZATA (1 min prima del reset) ---
+            # Se mancano meno di 2 minuti alla fine delle 4 ore (es. sono le 03:59)
+            next_block = this_block + timedelta(hours=4)
+            time_to_reset = (next_block - datetime.now(timezone.utc)).total_seconds()
 
-            if current_day != last_day:
+            if size > 0 and time_to_reset <= 90: # Meno di 1.5 min al cambio
+                exit_side = "Sell" if side_active == "Buy" else "Buy"
+                session.place_order(category="linear", symbol=SYMBOL, side=exit_side, orderType="Market", qty=str(size))
+                send_telegram("Chiusura preventiva fine blocco 4H")
+                trade_done_in_block = True # Impedisce riaperture nell'ultimo minuto
 
-                if size > 0:
+            # --- LOGICA INGRESSO ---
+            if size == 0 and not trade_done_in_block:
+                # Long: Prezzo TF1 > Bias 4H e Prezzo > EMA 18
+                if price > bias_val and price > ema_val:
+                    if execute_trade("Buy", price):
+                        trade_done_in_block = True
+                
+                # Short: Prezzo TF1 < Bias 4H e Prezzo < EMA 18
+                elif price < bias_val and price < ema_val:
+                    if execute_trade("Sell", price):
+                        trade_done_in_block = True
 
-                    exit_side = "Sell" if side_active == "Buy" else "Buy"
-
-                    session.place_order(
-                        category="linear",
-                        symbol=SYMBOL,
-                        side=exit_side,
-                        orderType="Market",
-                        qty=str(size)
-                    )
-
-                    send_telegram("Reset Daily chiusura posizione")
-
-                else:
-
-                    send_telegram("Reset Daily")
-
-                last_day = current_day
-
-            if size == 0:
-
-                if (
-                    price > daily_close
-                    and (not USE_EMA_FILTER or price > ema_val)
-                ):
-
-                    execute_trade("Buy", price)
-
-                elif (
-                    price < daily_close
-                    and (not USE_EMA_FILTER or price < ema_val)
-                ):
-
-                    execute_trade("Sell", price)
-
-            else:
-
-                print(
-                    f"{side_active} attiva | "
-                    f"PNL {pnl:.2f}"
-                )
+            print(f"[{now.strftime('%H:%M')}] Price: {price} | Bias: {bias_val} | EMA: {ema_val:.2f} | TradeDone: {trade_done_in_block}")
 
         except Exception as e:
-
-            print("Errore loop:", e)
-
+            print(f"Errore loop: {e}")
             time.sleep(10)
-
-# ------------------------------------------------
 
 if __name__ == "__main__":
     run_strategy()
