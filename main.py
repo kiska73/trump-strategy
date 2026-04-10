@@ -14,6 +14,7 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
 SYMBOL = "ETHUSDT"
 FIXED_SIZE_USD = 1000
+OFFSET_MINUTES = 30  # Strategia "Trump": entra 30 min dopo l'inizio del blocco 4H
 
 # Parametri Strategia
 TP_PERC = 3.0 / 100
@@ -48,13 +49,11 @@ def get_precision(symbol):
             info = res["result"]["list"][0]
             qty_step = float(info["lotSizeFilter"]["qtyStep"])
             price_step = float(info["priceFilter"]["tickSize"])
-            
-            # Calcola il numero di decimali dal qtyStep (es: 0.01 -> 2)
             qty_precision = max(0, int(-math.log10(qty_step)))
             price_precision = max(0, int(-math.log10(price_step)))
             return qty_precision, price_precision
     except:
-        return 2, 2 # Default prudenziale
+        return 2, 2
     return 2, 2
 
 def get_current_position():
@@ -70,9 +69,11 @@ def get_current_position():
 
 def get_data_signals():
     try:
+        # Bias basato su candele standard 4H (240 min)
         d = session.get_kline(category="linear", symbol=SYMBOL, interval="240", limit=2)
-        bias_4h_val = float(d["result"]["list"][1][4]) 
+        bias_4h_val = float(d["result"]["list"][1][4]) # Chiusura dell'ultima candela 4H completata
 
+        # EMA e Prezzo basati su timeframe 1m per precisione d'ingresso
         m = session.get_kline(category="linear", symbol=SYMBOL, interval="1", limit=150)
         df = pd.DataFrame(m["result"]["list"], columns=["time","open","high","low","close","vol","turnover"])
         df["close"] = df["close"].astype(float)
@@ -80,24 +81,20 @@ def get_data_signals():
         
         df["ema"] = df["close"].ewm(span=EMA_LENGTH, adjust=False).mean()
 
-        closed_candle_price = df["close"].iloc[-2]
-        ema_val = df["ema"].iloc[-2]
+        last_price = df["close"].iloc[-1]
+        ema_val = df["ema"].iloc[-1]
         
-        return bias_4h_val, ema_val, closed_candle_price
+        return bias_4h_val, ema_val, last_price
     except Exception as e:
-        print(f"Errore recupero dati API: {e}")
+        print(f"Errore recupero dati: {e}")
         return None, None, None
 
 def execute_trade(side, price):
-    """Esegue l'ordine Market con TP e SL adattati alla precisione di Bybit"""
     try:
         qty_prec, price_prec = get_precision(SYMBOL)
-        
-        # Calcolo quantità con troncamento (non arrotondamento) per evitare errori di margine
         raw_qty = FIXED_SIZE_USD / price
         qty = math.floor(raw_qty * (10**qty_prec)) / (10**qty_prec)
         
-        # Calcolo TP e SL arrotondati correttamente per il prezzo
         tp = round(price * (1 + TP_PERC) if side == "Buy" else price * (1 - TP_PERC), price_prec)
         sl = round(price * (1 - SL_PERC) if side == "Buy" else price * (1 + SL_PERC), price_prec)
 
@@ -107,66 +104,73 @@ def execute_trade(side, price):
         )
         
         if order["retCode"] == 0:
-            msg = f"🚀 ORDINE {side} ESEGUITO\nQuantità: {qty}\nPrezzo: {price}\nTP: {tp} | SL: {sl}"
+            msg = f"🚀 TRUMP TRADE: {side}\nQty: {qty}\nPrice: {price}\nTP: {tp} | SL: {sl}"
             print(msg)
             send_telegram(msg)
             return True
-        else:
-            print(f"Errore Bybit (RetCode: {order['retCode']}): {order['retMsg']}")
-            return False
+        return False
     except Exception as e:
-        print(f"Eccezione durante esecuzione ordine: {e}")
+        print(f"Errore esecuzione: {e}")
         return False
 
 def run_strategy():
     global current_bias_block, trade_done_in_block
-    print("🤖 Bot Trump 4H Avviato...")
-    send_telegram("🤖 Bot Trump 4H (Versione Anti-Whipsaw) Attivo")
+    print("🇺🇸 Bot Trump 4H (30-min Offset) Avviato...")
+    send_telegram("🇺🇸 Bot Trump 4H attivo. Offset: 30min dopo il blocco standard.")
 
     while True:
         try:
             now = datetime.now(timezone.utc)
             
-            # Reset Blocco 4H
-            block_start_hour = (now.hour // 4) * 4
-            this_block = now.replace(hour=block_start_hour, minute=0, second=0, microsecond=0)
+            # --- LOGICA CALCOLO BLOCCO SFASATO ---
+            standard_hour = (now.hour // 4) * 4
+            # Il blocco per il bot inizia alle HH:30 invece che alle HH:00
+            this_block_start = now.replace(hour=standard_hour, minute=OFFSET_MINUTES, second=0, microsecond=0)
             
-            if current_bias_block != this_block:
-                current_bias_block = this_block
+            # Se siamo tra le 00:00 e le 00:29, apparteniamo ancora al blocco delle 20:30 del giorno prima
+            if now < this_block_start:
+                # Sottraiamo 4 ore per trovare l'inizio del blocco precedente
+                prev_time = this_block_start - timedelta(hours=4)
+                this_block_start = prev_time
+
+            # Reset se entriamo in un nuovo intervallo di 4 ore
+            if current_bias_block != this_block_start:
+                current_bias_block = this_block_start
                 trade_done_in_block = False
-                send_telegram(f"🕒 Nuovo blocco 4H: {this_block.strftime('%H:%M')} UTC.")
+                send_telegram(f"🕒 Nuovo ciclo operativo iniziato: {this_block_start.strftime('%H:%M')} UTC")
 
-            # Sync al minuto (attende l'inizio del minuto + 2 sec)
-            secs_to_wait = 60 - datetime.now().second
-            time.sleep(secs_to_wait + 2) 
+            # Controllo ogni minuto
+            time.sleep(60)
 
-            bias_val, ema_val, last_close = get_data_signals()
+            bias_val, ema_val, last_price = get_data_signals()
             if bias_val is None: continue
 
             side_active, size, entry, pnl = get_current_position()
 
-            # Chiusura preventiva fine blocco
-            next_block = this_block + timedelta(hours=4)
-            time_to_reset = (next_block - datetime.now(timezone.utc)).total_seconds()
+            # 1. CHIUSURA PREVENTIVA (2 minuti prima del prossimo "Trump Block")
+            next_block = this_block_start + timedelta(hours=4)
+            seconds_to_reset = (next_block - now).total_seconds()
 
-            if size > 0 and time_to_reset <= 120:
+            if size > 0 and seconds_to_reset <= 120:
                 exit_side = "Sell" if side_active == "Buy" else "Buy"
                 session.place_order(category="linear", symbol=SYMBOL, side=exit_side, orderType="Market", qty=str(size))
-                send_telegram("⚠️ Chiusura preventiva fine blocco")
+                send_telegram("⚠️ Fine turno: Chiusura posizione pre-nuovo blocco.")
                 trade_done_in_block = True 
 
-            # Logica Ingresso
+            # 2. LOGICA INGRESSO (Solo se siamo oltre i 30 min e non abbiamo ancora operato)
             if size == 0 and not trade_done_in_block:
-                if last_close > bias_val and last_close > ema_val:
-                    if execute_trade("Buy", last_close):
+                # Verifichiamo se il prezzo conferma il bias dopo il "rumore" iniziale
+                if last_price > bias_val and last_price > ema_val:
+                    if execute_trade("Buy", last_price):
                         trade_done_in_block = True
                 
-                elif last_close < bias_val and last_close < ema_val:
-                    if execute_trade("Sell", last_close):
+                elif last_price < bias_val and last_price < ema_val:
+                    if execute_trade("Sell", last_price):
                         trade_done_in_block = True
 
-            status = "In attesa" if not trade_done_in_block else "Blocco completato/Posizione aperta"
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Prezzo: {last_close} | Bias: {bias_val} | EMA: {ema_val:.2f} | {status}")
+            status = "Wait 30m" if now < this_block_start else "Scanning"
+            if trade_done_in_block: status = "Done"
+            print(f"[{now.strftime('%H:%M')}] Px: {last_price} | Bias: {bias_val} | EMA: {ema_val:.1f} | Stat: {status}")
 
         except Exception as e:
             print(f"Errore loop: {e}")
